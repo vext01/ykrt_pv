@@ -262,6 +262,49 @@ mod tests {
         assert!(pack == PHASE_COMPILING || pack & PHASE_TAG == PHASE_COMPILED);
     }
 
+    // Test using two MetaTracer instances in the same thread.
+    #[test]
+    fn threshold_passed_multiple_metatracers() {
+        let hot_thrsh = 4000;
+        let mt1 = MetaTracer::new_with_hot_threshold(hot_thrsh);
+        let mt2 = MetaTracer::new_with_hot_threshold(hot_thrsh);
+        let loc1 = Location::new();
+        let loc2 = Location::new();
+
+        let mut lp1;
+        let mut lp2;
+        // Get both locations to one less than their hot threshold.
+        for _ in 0..hot_thrsh {
+            mt1.control_point(&loc1);
+            mt2.control_point(&loc2);
+            lp1 = loc1.pack.load(Ordering::Relaxed);
+            lp2 = loc2.pack.load(Ordering::Relaxed);
+            assert_eq!(lp1 & PHASE_TAG, PHASE_COUNTING);
+            assert_eq!(lp2 & PHASE_TAG, PHASE_COUNTING);
+        }
+
+        // mt1 starts tracing, mt2 wants to, but our thread's tracer is busy.
+        mt1.control_point(&loc1);
+        mt2.control_point(&loc2);
+        lp1 = loc1.pack.load(Ordering::Relaxed);
+        lp2 = loc2.pack.load(Ordering::Relaxed);
+        assert_eq!(lp1 & PHASE_TAG, PHASE_TRACING);
+        assert_eq!(lp2 & PHASE_TAG, PHASE_COUNTING);
+
+        // mt1 finishes tracing, freeing up our thread's tracer for mt2.
+        mt1.control_point(&loc1);
+        mt2.control_point(&loc2);
+        lp1 = loc1.pack.load(Ordering::Relaxed);
+        lp2 = loc2.pack.load(Ordering::Relaxed);
+        assert!(lp1 == PHASE_COMPILING || lp1 & PHASE_TAG == PHASE_COMPILED);
+        assert_eq!(lp2 & PHASE_TAG, PHASE_TRACING);
+
+        // Once more and mt2 is finished tracing too.
+        mt2.control_point(&loc2);
+        lp2 = loc2.pack.load(Ordering::Relaxed);
+        assert!(lp2 == PHASE_COMPILING || lp2 & PHASE_TAG == PHASE_COMPILED);
+    }
+
     #[test]
     fn threaded_threshold_passed() {
         let hot_thrsh = 4000;
