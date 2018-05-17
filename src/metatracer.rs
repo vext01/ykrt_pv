@@ -30,20 +30,77 @@
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::{
+    cell::RefCell,
+    sync::{atomic::{AtomicU32, Ordering}, Arc, RwLock},
+    thread,
+};
+use hwtracer::{
+    Trace, Tracer, HWTracerError, TracerState,
+    backends::{perf_pt::PerfPTTracer, dummy::DummyTracer},
+};
+
+thread_local! {
+    // Each thread has its own tracer, initialised on first use.
+    pub static THREAD_TRACER: RefCell<Option<Box<Tracer>>> = RefCell::new(None);
+}
+
+// Execute a closure which accepts the current thread's tracer as its sole argument.
+//
+// If the tracer doesn't exist, it is created.
+fn with_thread_tracer<F>(f: F) where F: FnOnce(&mut Box<Tracer>) {
+    THREAD_TRACER.with(|key| {
+        let mut opt_box_tr = key.borrow_mut();
+        if opt_box_tr.is_none() {
+            // The tracer for this thread has not been initialised yet. Make it.
+            *opt_box_tr = Some(tracer());
+        }
+        f(opt_box_tr.as_mut().unwrap())
+    });
+}
+
+/// Instantiate a tracer suitable for the current platform.
+fn tracer() -> Box<Tracer> {
+    if cfg!(target_os = "linux") {
+        match PerfPTTracer::new(PerfPTTracer::config()) {
+            Ok(ptt) => return Box::new(ptt),
+            Err(e) => {
+                eprintln!("Warning: software or hardware doesn't support Intel PT. \
+                          Using dummy backend: {}", e);
+                return Box::new(DummyTracer::new())
+            }
+        }
+    }
+    eprintln!("Warning: No backend for this OS. Using dummy backend");
+    return Box::new(DummyTracer::new());
+}
 
 pub type HotThreshold = u32;
 const DEFAULT_HOT_THRESHOLD: HotThreshold = 50;
 
 // The current meta-tracing phase of a given location in the end-user's code. Consists of a tag and
 // (optionally) a value. The tags are in the high order bits since we expect the most common tag is
-// PHASE_COMPILED which (one day) will have an index associated with it. By also making that tag
-// 0b00, we allow that index to be accessed without any further operations after the initial
-// tag check.
+// PHASE_COMPILED which has an index associated with it. By also making that tag 0b00, we allow
+// that index to be accessed without any further operations after the initial tag check.
 const PHASE_TAG     : u32 = 0b11 << 30; // All of the other PHASE_ tags must fit in this.
-const PHASE_COMPILED: u32 = 0b00 << 30;
+const PHASE_COMPILED: u32 = 0b00 << 30; // The value specifies the compiled trace ID.
 const PHASE_TRACING : u32 = 0b01 << 30;
 const PHASE_COUNTING: u32 = 0b10 << 30; // The value specifies the current hot count.
+const PHASE_COMPILING: u32 = 0b11 << 30;
+
+/// A compiled native code trace.
+struct Code {}
+
+impl Code {
+    fn compile(_: &Box<Trace>) -> Self {
+        // XXX actually compile the trace.
+        Self {}
+    }
+
+    fn execute(&self) {
+        // XXX actually execute the trace.
+    }
+}
 
 /// A `Location` uniquely identifies a control point position in the end-user's program (and is
 /// used by the `MetaTracer` to store data about that location). In other words, every position
@@ -54,20 +111,23 @@ const PHASE_COUNTING: u32 = 0b10 << 30; // The value specifies the current hot c
 /// `Location`. For interpreters that can't (or don't want) to be as selective, a simple (if
 /// moderately wasteful) mechanism is for every bytecode or AST node to have its own `Location`
 /// (even for bytecodes or nodes that can't be control points).
+///
+/// Location is shareable amongst threads.
 pub struct Location {
-    pack: AtomicU32
+    pack: Arc<AtomicU32>,
 }
 
 impl Location {
     /// Create a fresh Location suitable for passing to `MetaTracer::control_point`.
     pub fn new() -> Self {
-        Self { pack: AtomicU32::new(PHASE_COUNTING) }
+        Self { pack: Arc::new(AtomicU32::new(PHASE_COUNTING)) }
     }
 }
 
 /// A meta-tracer.
 pub struct MetaTracer {
-    hot_threshold: HotThreshold
+    hot_threshold: HotThreshold,
+    code_cache: Arc<RwLock<Vec<Code>>>, // Compiled traces. Indices serve as unique identifiers.
 }
 
 impl MetaTracer {
@@ -79,43 +139,101 @@ impl MetaTracer {
     /// Create a new `MetaTracer` with a specific hot threshold.
     pub fn new_with_hot_threshold(hot_threshold: HotThreshold) -> Self {
         Self {
-            hot_threshold: hot_threshold
+            hot_threshold: hot_threshold,
+            code_cache: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
-    /// Attempt to execute a compiled trace for location `loc`: return a `ControlOutcome` to allow
-    /// the end user to determine whether a trace was executed or not.
-    pub fn control_point(&self, loc: &Location)
-    {
+    /// Attempt to execute a compiled trace for location `loc`.
+    pub fn control_point(&self, loc: &Location) {
         // Since we don't hold an explicit lock, updating a Location is tricky: we might read a
         // Location, work out what we'd like to update it to, and try updating it, only to find
         // that another thread interrupted us part way through. We therefore use compare_and_swap
         // to update values, allowing us to detect if we were interrupted. If we were interrupted,
         // we simply retry the whole operation.
+        let mut trace: Option<Box<Trace>> = None;
         loop {
             let pack = &loc.pack;
-            // We need Acquire ordering, as PHASE_COMPILED will need to read information written to
-            // external data as a result of the PHASE_TRACING -> PHASE_COMPILED transition.
             let lp = pack.load(Ordering::Acquire);
             match lp & PHASE_TAG {
                 PHASE_COUNTING => {
                     let count = lp & !PHASE_TAG;
-                    let new_pack;
                     if count >= self.hot_threshold {
-                        new_pack = PHASE_TRACING;
+                        if pack.compare_and_swap(lp, PHASE_TRACING, Ordering::Release) == lp {
+                            // Only start tracing once updating the pack has succeeded to avoid
+                            // tracing multiple iterations of the phase update loop.
+                            let mut res = Ok(());
+                            with_thread_tracer(|tracer| res = tracer.start_tracing());
+                            match res {
+                                Ok(_) => break,
+                                Err(HWTracerError::TracerState(TracerState::Started)) => {
+                                    // This thread's tracer is already tracing something (it even
+                                    // could have been initiated from another instance of
+                                    // MetaTracer in the same thread). Roll back the pack to as it
+                                    // was before. We can't clash with another thread at this
+                                    // point, as no one else could have mutated this location since
+                                    // we tagged it PHASE_TRACING.
+                                    pack.store(PHASE_COUNTING | count, Ordering::Relaxed);
+                                    break;
+                                },
+                                Err(e) => unreachable!("{}", e),
+                            }
+                        }
                     } else {
-                        new_pack = PHASE_COUNTING | (count + 1);
-                    }
-                    if pack.compare_and_swap(lp, new_pack, Ordering::Release) == lp {
-                        break;
+                        let new_pack = PHASE_COUNTING | (count + 1);
+                        if pack.compare_and_swap(lp, new_pack, Ordering::Release) == lp {
+                            break;
+                        }
                     }
                 },
                 PHASE_TRACING => {
-                    if pack.compare_and_swap(lp, PHASE_COMPILED, Ordering::Release) == lp {
+                    if trace.is_none() {
+                        // It wouldn't make sense to stop tracing multiple times, so stash the
+                        // trace first time around the pack update loop only.
+                        let mut res = Err(HWTracerError::Unknown);
+                        with_thread_tracer(|tracer| res = tracer.stop_tracing());
+                        match res {
+                            Ok(t) => {
+                                // We've arrived back at the Location from which we started tracing
+                                // and the current thread is the one that started the tracing.
+                                trace = Some(t);
+                            },
+                            Err(HWTracerError::TracerState(TracerState::Stopped)) => {
+                                // Another thread is tracing this location. Do nothing.
+                                break;
+                            },
+                            Err(e) => panic!("Unexpected tracer error: {}", e),
+                        }
+                    }
+                    if pack.compare_and_swap(lp, PHASE_COMPILING, Ordering::Release) == lp {
+                        // Compilation is done in a background thread.
+                        let thr_pack = Arc::clone(&pack);
+                        let thr_code_cache = Arc::clone(&self.code_cache);
+                        thread::spawn(move || {
+                            let code = Code::compile(&trace.unwrap());
+                            let mut thr_code_cache_w = thr_code_cache.write().unwrap();
+                            // Store the index of where the new code exists in the code cache into
+                            // the value part of the pack so we can look it up in constant time.
+                            let idx = thr_code_cache_w.len() as u32;
+                            thr_code_cache_w.push(code);
+                            // We don't need a retry loop here. Once a location enters
+                            // PHASE_COMPILING, no-one else can be mutating at the same time.
+                            // Release ordering prevents a potential out-of-bounds Vector access.
+                            // Another thread must not see `PHASE_COMPILED | idx` before an entry
+                            // with index `idx` has actually entered the code cache.
+                            thr_pack.store(PHASE_COMPILED | idx, Ordering::Release);
+                        });
                         break;
                     }
                 },
-                PHASE_COMPILED => break,
+                PHASE_COMPILING => {
+                    // We are still waiting for compiled code to appear.
+                    break;
+                },
+                PHASE_COMPILED => {
+                    self.code_cache.read().unwrap()[lp as usize].execute();
+                    break;
+                }
                 _ => unreachable!()
             }
         }
@@ -124,7 +242,6 @@ impl MetaTracer {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::thread;
     use test::{Bencher, black_box};
     use super::*;
@@ -141,7 +258,8 @@ mod tests {
         mt.control_point(&lp);
         assert_eq!(lp.pack.load(Ordering::Relaxed), PHASE_TRACING);
         mt.control_point(&lp);
-        assert_eq!(lp.pack.load(Ordering::Relaxed), PHASE_COMPILED);
+        let pack = lp.pack.load(Ordering::Relaxed);
+        assert!(pack == PHASE_COMPILING || pack & PHASE_TAG == PHASE_COMPILED);
     }
 
     #[test]
@@ -184,7 +302,8 @@ mod tests {
         mt_arc.control_point(&lp_arc);
         assert_eq!(lp_arc.pack.load(Ordering::Relaxed), PHASE_TRACING);
         mt_arc.control_point(&lp_arc);
-        assert_eq!(lp_arc.pack.load(Ordering::Relaxed), PHASE_COMPILED);
+        let lp = lp_arc.pack.load(Ordering::Relaxed);
+        assert!(lp == PHASE_COMPILING || lp & PHASE_TAG == PHASE_COMPILED);
     }
 
     #[bench]

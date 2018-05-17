@@ -34,6 +34,7 @@
 #![feature(test)]
 
 extern crate test;
+extern crate hwtracer;
 
 pub mod metatracer;
 
