@@ -305,6 +305,43 @@ mod tests {
         assert!(lp2 == PHASE_COMPILING || lp2 & PHASE_TAG == PHASE_COMPILED);
     }
 
+    // Check that sharing a single MetaTracer instance amongst two threads works OK.
+    #[test]
+    fn shared_metatracer() {
+        let hot_thrsh = 4000;
+        let tracer = Arc::new(MetaTracer::new_with_hot_threshold(hot_thrsh));
+        let thr_tracer = Arc::clone(&tracer);
+        let loc = Arc::new(Location::new());
+        let thr_loc = Arc::clone(&loc);
+
+        // Child thread pumps the hot count by half of the threshold.
+        let thr = thread::spawn(move || {
+            for _ in 0..hot_thrsh / 2 {
+                thr_tracer.control_point(&thr_loc);
+                let lp = thr_loc.pack.load(Ordering::Relaxed);
+                assert_eq!(lp & PHASE_TAG, PHASE_COUNTING);
+            }
+        });
+
+        // Parent thread pumps the hot count the rest of the way.
+        let mut lp;
+        for _ in 0..hot_thrsh / 2 {
+            tracer.control_point(&loc);
+            lp = loc.pack.load(Ordering::Relaxed);
+            assert_eq!(lp & PHASE_TAG, PHASE_COUNTING);
+        }
+        thr.join().unwrap();
+
+        // At this point, the Location is on the brink of becoming hot.
+        tracer.control_point(&loc);
+        lp = loc.pack.load(Ordering::Relaxed);
+        assert_eq!(lp & PHASE_TAG, PHASE_TRACING);
+
+        tracer.control_point(&loc);
+        lp = loc.pack.load(Ordering::Relaxed);
+        assert!(lp == PHASE_COMPILING || lp & PHASE_TAG == PHASE_COMPILED);
+    }
+
     #[test]
     fn threaded_threshold_passed() {
         let hot_thrsh = 4000;
