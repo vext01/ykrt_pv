@@ -37,8 +37,10 @@ use std::{
 };
 use hwtracer::{
     Trace, Tracer, HWTracerError, TracerState,
-    backends::{perf_pt::PerfPTTracer, dummy::DummyTracer},
+    backends::dummy::DummyTracer,
 };
+#[cfg(perf_pt)]
+use hwtracer::backends::{perf_pt::PerfPTTracer};
 
 thread_local! {
     // Each thread has its own tracer, initialised on first use.
@@ -62,12 +64,14 @@ fn with_thread_tracer<F>(f: F) where F: FnOnce(&mut Box<Tracer>) {
 /// Instantiate a tracer suitable for the current platform.
 fn tracer() -> Box<Tracer> {
     if cfg!(target_os = "linux") {
-        match PerfPTTracer::new(PerfPTTracer::config()) {
-            Ok(ptt) => return Box::new(ptt),
-            Err(e) => {
-                eprintln!("Warning: software or hardware doesn't support Intel PT. \
+        #[cfg(perf_pt)] {
+            match PerfPTTracer::new(PerfPTTracer::config()) {
+                Ok(ptt) => return Box::new(ptt),
+                Err(e) => {
+                    eprintln!("Warning: software or hardware doesn't support Intel PT. \
                           Using dummy backend: {}", e);
-                return Box::new(DummyTracer::new())
+                    return Box::new(DummyTracer::new())
+                }
             }
         }
     }
