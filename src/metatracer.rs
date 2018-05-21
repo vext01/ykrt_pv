@@ -39,7 +39,7 @@ use hwtracer::{
     Trace, Tracer, HWTracerError, TracerState,
     backends::dummy::DummyTracer,
 };
-#[cfg(perf_pt)]
+#[cfg(hwtracer_perf_pt)]
 use hwtracer::backends::{perf_pt::PerfPTTracer};
 
 thread_local! {
@@ -63,20 +63,21 @@ fn with_thread_tracer<F>(f: F) where F: FnOnce(&mut Box<Tracer>) {
 
 /// Instantiate a tracer suitable for the current platform.
 fn tracer() -> Box<Tracer> {
-    if cfg!(target_os = "linux") {
-        #[cfg(perf_pt)] {
-            match PerfPTTracer::new(PerfPTTracer::config()) {
-                Ok(ptt) => return Box::new(ptt),
-                Err(e) => {
-                    eprintln!("Warning: software or hardware doesn't support Intel PT. \
-                          Using dummy backend: {}", e);
-                    return Box::new(DummyTracer::new())
-                }
+    #[cfg(hwtracer_perf_pt)] {
+        match PerfPTTracer::new(PerfPTTracer::config()) {
+            Ok(ptt) => return Box::new(ptt),
+            Err(e) => {
+                eprintln!("Warning: software or hardware doesn't support Intel PT. \
+                      Using dummy backend: {}", e);
+                return Box::new(DummyTracer::new())
             }
         }
     }
-    eprintln!("Warning: No backend for this OS. Using dummy backend");
-    return Box::new(DummyTracer::new());
+    // If the perf_pt backend is available, then this becomes unreachable.
+    #[allow(unreachable_code)] {
+        eprintln!("Warning: No backend for this OS. Using dummy backend");
+        return Box::new(DummyTracer::new());
+    }
 }
 
 pub type HotThreshold = u32;
