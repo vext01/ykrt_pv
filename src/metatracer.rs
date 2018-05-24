@@ -35,49 +35,27 @@ use std::{
     sync::{atomic::{AtomicU32, Ordering}, Arc, RwLock},
     thread,
 };
-use hwtracer::{
-    Trace, Tracer, HWTracerError, TracerState,
-    backends::dummy::DummyTracer,
-};
+use hwtracer::{Trace, Tracer, ThreadTracer, HWTracerError, TracerState};
 #[cfg(hwtracer_perf_pt)]
 use hwtracer::backends::{perf_pt::PerfPTTracer};
 
 thread_local! {
-    // Each thread has its own tracer, initialised on first use.
-    pub static THREAD_TRACER: RefCell<Option<Box<Tracer>>> = RefCell::new(None);
+    // Each thread has its own `ThreadTracer`, initialised lazily on first use.
+    pub static THREAD_TRACER: RefCell<Option<Box<ThreadTracer>>> = RefCell::new(None);
 }
 
 // Execute a closure which accepts the current thread's tracer as its sole argument.
 //
 // If the tracer doesn't exist, it is created.
-fn with_thread_tracer<F>(f: F) where F: FnOnce(&mut Box<Tracer>) {
+fn with_thread_tracer<F>(tracer: &Box<Tracer>, f: F) where F: FnOnce(&mut Box<ThreadTracer>) {
     THREAD_TRACER.with(|key| {
         let mut opt_box_tr = key.borrow_mut();
         if opt_box_tr.is_none() {
-            // The tracer for this thread has not been initialised yet. Make it.
-            *opt_box_tr = Some(tracer());
+            // The `ThreadTracer` for this thread has not been created yet. Make it now.
+            *opt_box_tr = Some(tracer.thread_tracer());
         }
         f(opt_box_tr.as_mut().unwrap())
     });
-}
-
-/// Instantiate a tracer suitable for the current platform.
-fn tracer() -> Box<Tracer> {
-    #[cfg(hwtracer_perf_pt)] {
-        match PerfPTTracer::new(PerfPTTracer::config()) {
-            Ok(ptt) => return Box::new(ptt),
-            Err(e) => {
-                eprintln!("Warning: software or hardware doesn't support Intel PT. \
-                      Using dummy backend: {}", e);
-                return Box::new(DummyTracer::new())
-            }
-        }
-    }
-    // If the perf_pt backend is available, then this becomes unreachable.
-    #[allow(unreachable_code)] {
-        eprintln!("Warning: No backend for this OS. Using dummy backend");
-        return Box::new(DummyTracer::new());
-    }
 }
 
 pub type HotThreshold = u32;
@@ -131,19 +109,21 @@ impl Location {
 
 /// A meta-tracer.
 pub struct MetaTracer {
+    tracer: Box<Tracer>,                // A `Tracer` from which to make `ThreadTracers`.
     hot_threshold: HotThreshold,
     code_cache: Arc<RwLock<Vec<Code>>>, // Compiled traces. Indices serve as unique identifiers.
 }
 
 impl MetaTracer {
     /// Create a new `MetaTracer` with default settings.
-    pub fn new() -> Self {
-        Self::new_with_hot_threshold(DEFAULT_HOT_THRESHOLD)
+    pub fn new(tracer: Box<Tracer>) -> Self {
+        Self::new_with_hot_threshold(tracer, DEFAULT_HOT_THRESHOLD)
     }
 
     /// Create a new `MetaTracer` with a specific hot threshold.
-    pub fn new_with_hot_threshold(hot_threshold: HotThreshold) -> Self {
+    pub fn new_with_hot_threshold(tracer: Box<Tracer>, hot_threshold: HotThreshold) -> Self {
         Self {
+            tracer: tracer,
             hot_threshold: hot_threshold,
             code_cache: Arc::new(RwLock::new(Vec::new())),
         }
@@ -168,7 +148,7 @@ impl MetaTracer {
                             // Only start tracing once updating the pack has succeeded to avoid
                             // tracing multiple iterations of the phase update loop.
                             let mut res = Ok(());
-                            with_thread_tracer(|tracer| res = tracer.start_tracing());
+                            with_thread_tracer(&self.tracer, |thr_tracer| res = thr_tracer.start_tracing());
                             match res {
                                 Ok(_) => break,
                                 Err(HWTracerError::TracerState(TracerState::Started)) => {
@@ -196,7 +176,7 @@ impl MetaTracer {
                         // It wouldn't make sense to stop tracing multiple times, so stash the
                         // trace first time around the pack update loop only.
                         let mut res = Err(HWTracerError::Unknown);
-                        with_thread_tracer(|tracer| res = tracer.stop_tracing());
+                        with_thread_tracer(&self.tracer, |tracer| res = tracer.stop_tracing());
                         match res {
                             Ok(t) => {
                                 // We've arrived back at the Location from which we started tracing
@@ -250,11 +230,16 @@ mod tests {
     use std::thread;
     use test::{Bencher, black_box};
     use super::*;
+    use hwtracer::backends::TracerBuilder;
+
+    fn default_tracer() -> Box<Tracer> {
+        TracerBuilder::new().build().unwrap()
+    }
 
     #[test]
     fn threshold_passed() {
         let hot_thrsh = 1500;
-        let mt = MetaTracer::new_with_hot_threshold(hot_thrsh);
+        let mt = MetaTracer::new_with_hot_threshold(default_tracer(), hot_thrsh);
         let lp = Location::new();
         for i in 0..hot_thrsh {
             mt.control_point(&lp);
@@ -271,8 +256,8 @@ mod tests {
     #[test]
     fn threshold_passed_multiple_metatracers() {
         let hot_thrsh = 4000;
-        let mt1 = MetaTracer::new_with_hot_threshold(hot_thrsh);
-        let mt2 = MetaTracer::new_with_hot_threshold(hot_thrsh);
+        let mt1 = MetaTracer::new_with_hot_threshold(default_tracer(), hot_thrsh);
+        let mt2 = MetaTracer::new_with_hot_threshold(default_tracer(), hot_thrsh);
         let loc1 = Location::new();
         let loc2 = Location::new();
 
@@ -314,7 +299,7 @@ mod tests {
     #[test]
     fn shared_metatracer() {
         let hot_thrsh = 4000;
-        let tracer = Arc::new(MetaTracer::new_with_hot_threshold(hot_thrsh));
+        let tracer = Arc::new(MetaTracer::new_with_hot_threshold(default_tracer(), hot_thrsh));
         let thr_tracer = Arc::clone(&tracer);
         let loc = Arc::new(Location::new());
         let thr_loc = Arc::clone(&loc);
@@ -352,7 +337,7 @@ mod tests {
         let hot_thrsh = 4000;
         let mt_arc;
         {
-            let mt = MetaTracer::new_with_hot_threshold(hot_thrsh);
+            let mt = MetaTracer::new_with_hot_threshold(default_tracer(), hot_thrsh);
             mt_arc = Arc::new(mt);
         }
         let lp_arc = Arc::new(Location::new());
@@ -393,7 +378,7 @@ mod tests {
 
     #[bench]
     fn bench_single_threaded_control_point(b: &mut Bencher) {
-        let mt = MetaTracer::new();
+        let mt = MetaTracer::new(default_tracer());
         let lp = Location::new();
         b.iter(|| {
             for _ in 0..100000 {
@@ -404,7 +389,7 @@ mod tests {
 
     #[bench]
     fn bench_multi_threaded_control_point(b: &mut Bencher) {
-        let mt_arc = Arc::new(MetaTracer::new());
+        let mt_arc = Arc::new(MetaTracer::new(default_tracer()));
         let lp_arc = Arc::new(Location::new());
         b.iter(|| {
             let mut thrs = vec![];
