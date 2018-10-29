@@ -1,4 +1,4 @@
-// Copyright (c) 2017 King's College London
+// Copyright (c) 2018 King's College London
 // created by the Software Development Team <http://soft-dev.org/>
 //
 // The Universal Permissive License (UPL), Version 1.0
@@ -30,14 +30,18 @@
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-#![feature(integer_atomics)]
-#![feature(test)]
+use std::io;
 
-extern crate test;
-extern crate elf;
-extern crate byteorder;
+#[derive(Debug)]
+pub enum TraceMappingError {
+    /// Wrapped IO error.
+    Io(io::Error),
+    /// No MIR section found in the binary.
+    NoCfg,
+}
 
-pub mod metatracer;
-mod trace_mapping;
-
-pub use metatracer::{Location, MetaTracer};
+impl From<io::Error> for TraceMappingError {
+    fn from(e: io::Error) -> TraceMappingError {
+        TraceMappingError::Io(e)
+    }
+}

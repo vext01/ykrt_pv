@@ -3,3 +3,6 @@ name = "ykrt"
 version = "0.1.0"
 authors = ["Edd Barrett <vext01@gmail.com>", "Laurence Tratt <laurie@tratt.net>"]
 
+[dependencies]
+elf = "0.0"
+byteorder = "1.2"

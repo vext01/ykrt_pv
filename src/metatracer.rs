@@ -31,6 +31,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 use std::sync::atomic::{AtomicU32, Ordering};
+use trace_mapping::MappingCtxt;
 
 pub type HotThreshold = u32;
 const DEFAULT_HOT_THRESHOLD: HotThreshold = 50;
@@ -67,7 +68,8 @@ impl Location {
 
 /// A meta-tracer.
 pub struct MetaTracer {
-    hot_threshold: HotThreshold
+    hot_threshold: HotThreshold,
+    _map_cx: MappingCtxt,
 }
 
 impl MetaTracer {
@@ -79,7 +81,8 @@ impl MetaTracer {
     /// Create a new `MetaTracer` with a specific hot threshold.
     pub fn new_with_hot_threshold(hot_threshold: HotThreshold) -> Self {
         Self {
-            hot_threshold: hot_threshold
+            hot_threshold: hot_threshold,
+            _map_cx: MappingCtxt::new().unwrap(), // XXX
         }
     }
 

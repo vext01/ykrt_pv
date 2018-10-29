@@ -1,4 +1,4 @@
-// Copyright (c) 2017 King's College London
+// Copyright (c) 2018 King's College London
 // created by the Software Development Team <http://soft-dev.org/>
 //
 // The Universal Permissive License (UPL), Version 1.0
@@ -30,14 +30,59 @@
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-#![feature(integer_atomics)]
-#![feature(test)]
+/// This module houses the mechanisms for mapping PT traces to MIR traces.
 
-extern crate test;
-extern crate elf;
-extern crate byteorder;
+pub mod errors;
+mod mir_cfg;
 
-pub mod metatracer;
-mod trace_mapping;
+use std::fmt::{self, Debug};
+use std::env;
+use trace_mapping::mir_cfg::MirCfg;
+use self::errors::TraceMappingError;
 
-pub use metatracer::{Location, MetaTracer};
+/// Represents a location in the MIR.
+#[derive(Clone, Eq, PartialEq, Hash)]
+pub struct MirLoc {
+    crate_hash: u64,
+    idx: u32,
+    bb: u32,
+}
+
+impl MirLoc {
+    pub fn new(crate_hash: u64, idx: u32, bb: u32) -> Self {
+        Self{crate_hash, idx, bb}
+    }
+
+    pub fn _crate_hash(&self) -> u64 {
+        self.crate_hash
+    }
+
+    pub fn _def_idx(&self) -> u32 {
+        self.idx
+    }
+
+    pub fn _basic_block(&self) -> u32 {
+        self.bb
+    }
+}
+
+impl Debug for MirLoc {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "MirLoc(0x{:08x}, {}, {})", self.crate_hash, self.idx, self.bb)
+    }
+}
+
+/// The top-level "context" for performing trace mappings.
+pub struct MappingCtxt {
+    /// Describes the control flow graph (CFG) of the MIR.
+    _cfg: MirCfg,
+}
+
+impl MappingCtxt {
+    pub fn new() -> Result<Self, TraceMappingError> {
+        let exe_path = env::current_exe().unwrap();
+        Ok(Self {
+            _cfg: MirCfg::new(&exe_path)?,
+        })
+    }
+}
